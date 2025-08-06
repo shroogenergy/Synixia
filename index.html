@@ -1,0 +1,87 @@
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+class ResidualBlock(nn.Module):
+    def __init__(self, channels):
+        super().__init__()
+        self.conv1 = nn.Conv2d(channels, channels, 3, padding=1, bias=False)
+        self.bn1   = nn.BatchNorm2d(channels)
+        self.conv2 = nn.Conv2d(channels, channels, 3, padding=1, bias=False)
+        self.bn2   = nn.BatchNorm2d(channels)
+        self.act   = nn.ReLU(inplace=True)
+    def forward(self, x):
+        r = self.act(self.bn1(self.conv1(x)))
+        r = self.bn2(self.conv2(r))
+        return self.act(x + r)
+
+class GraphReasoning(nn.Module):
+    def __init__(self, dim):
+        super().__init__()
+        self.fc_q = nn.Linear(dim, dim)
+        self.fc_k = nn.Linear(dim, dim)
+        self.fc_v = nn.Linear(dim, dim)
+        self.update = nn.Linear(dim, dim)
+    def forward(self, feats):
+        q = self.fc_q(feats)
+        k = self.fc_k(feats)
+        v = self.fc_v(feats)
+        A = F.softmax(torch.bmm(q, k.transpose(1,2)) / (feats.size(-1)**0.5), dim=-1)
+        agg = torch.bmm(A, v)
+        return self.update(agg)
+
+class ExternalMemory(nn.Module):
+    def __init__(self, mem_size=64, dim=256):
+        super().__init__()
+        self.register_buffer('mem', torch.randn(mem_size, dim))
+        self.read_w  = nn.Linear(dim, mem_size)
+        self.write_w = nn.Linear(dim, mem_size)
+        self.controller = nn.GRUCell(dim, dim)
+    def forward(self, x):
+        w_r = F.softmax(self.read_w(x), dim=-1)
+        w_w = F.softmax(self.write_w(x), dim=-1)
+        read_vec = w_r @ self.mem
+        delta = (w_w.unsqueeze(-1) * x.unsqueeze(1)).mean(0)
+        with torch.no_grad():
+            self.mem += delta
+        return self.controller(x, read_vec)
+
+class DynamicFusionNet(nn.Module):
+    def __init__(self, img_ch=3, prop_dim=32, hidden=256, n_heads=8, n_layers=6):
+        super().__init__()
+        self.stem = nn.Sequential(
+            nn.Conv2d(img_ch, hidden//2, 7, stride=2, padding=3, bias=False),
+            nn.BatchNorm2d(hidden//2), nn.ReLU(inplace=True),
+            ResidualBlock(hidden//2), ResidualBlock(hidden//2)
+        )
+        self.proj_token = nn.Linear(hidden//2, hidden)
+        self.prop_enc = nn.Sequential(
+            nn.Linear(prop_dim, hidden), nn.ReLU(inplace=True),
+            nn.Linear(hidden, hidden), nn.ReLU(inplace=True)
+        )
+        layer = nn.TransformerEncoderLayer(d_model=hidden, nhead=n_heads, dim_feedforward=hidden*4)
+        self.transformer = nn.TransformerEncoder(layer, num_layers=n_layers)
+        self.graph = GraphReasoning(hidden)
+        self.memory = ExternalMemory(mem_size=32, dim=hidden)
+        self.head = nn.Sequential(
+            nn.LayerNorm(hidden),
+            nn.Linear(hidden, hidden//2), nn.ReLU(inplace=True),
+            nn.Linear(hidden//2, hidden)
+        )
+    def forward(self, x_img, x_prop):
+        v = self.stem(x_img).flatten(2).transpose(1,2)
+        v = self.proj_token(v)
+        p = self.prop_enc(x_prop).unsqueeze(1)
+        seq = torch.cat([v, p], dim=1)
+        t = self.transformer(seq.transpose(0,1)).transpose(0,1)
+        g = self.graph(t)
+        agg = g.mean(dim=1)
+        m = self.memory(agg)
+        return self.head(m)
+
+if __name__ == "__main__":
+    model = DynamicFusionNet()
+    x_img = torch.randn(4,3,224,224)
+    x_prop = torch.randn(4,32)
+    out = model(x_img, x_prop)
+    print(out.shape)  # torch.Size([4,256])
